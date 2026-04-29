@@ -14,6 +14,7 @@ Two components, one platform:
 |-----------|----------|----------|------|
 | Phoenix Server | Cloud / on-prem | Rust (16+ services), Go, TypeScript | Detection engine, data store, analyst portal |
 | Sunbird Agent | Customer endpoints | Rust | Event collection, local detection, command execution |
+| phoenix-proto | Shared schemas | Protobuf | Canonical message contracts for all cross-component communication |
 
 The split exists for two complementary reasons. First, the endpoint agent must operate even when the network is unavailable — local Sigma rules, reputation caching, and inline prevention all work offline. Second, complex multi-machine correlation (grouping events from 1,000 sensors into a single attack session) requires server-side state and storage at a scale that an endpoint binary cannot maintain. The agent handles what must happen with microsecond latency on the machine; the server handles everything that benefits from global visibility and persistent analytics.
 
@@ -417,6 +418,93 @@ The static HKDF key used on Linux/macOS is XOR-obfuscated (mask `0xBD`) in the b
 
 ---
 
+## Phoenix Proto — Deep Dive
+
+### What It Is
+
+`phoenix-proto` is the canonical Protobuf schema repository for the Phoenix EDR/XDR platform. It is the single source of truth for every message contract exchanged across all three major platform components — the Phoenix Server, the Sunbird Agent, and downstream analytics or integration pipelines. It defines 236 proto files containing 1,607 messages, 284 enums, and 61 gRPC services spanning every wire format used on the platform: Kafka payloads, gRPC service interfaces, and sensor-to-gateway binary frames. The module is published as `com.cybereason/cybereason/phoenix` on the Buf Schema Registry.
+
+### Package Structure
+
+Proto sources live under `proto/` and are organised into two top-level namespaces:
+
+- **`cybereason.common.*`** — Primitive types shared across all packages: `Timestamp`, `Duration`, `DynamicFilter`, `PaginationRequest/Response`, and the standard gRPC health check proto.
+- **`cybereason.ecs.*`** — ECS-derived data model: agent identity (`CoreAgentInfo`, `AgentPolicy`), event layer (`SingleEvent`, `EventBatch`, `EventCommon`, `EventSpecific`), host entities (`Host`, `Process`, `File`), network entities (`Network`, `Dns`, `Http`), detection layer (`Detection`, `DetectionEngineClassification`), plus Windows-specific telemetry schemas.
+- **`cybereason.phoenix.*`** — Platform-specific services covering every server-side microservice: `platform_store`, `organization_store`, `detection_store`, `event_store`, `sensor_action_store`, `command_service`, `commandcontrol`, `cep`, `auth` (v1 deprecated, v2 current), `vault` (v1/v2), `etl_service` (v1/v2), `xdr_integration_store`, `integration_manager` (v1/v2), `integration_proxy` (v1/v2), `rulecontrol`, `asset_store`, `sensor_gateway`, `threat_intel`, and others.
+
+API versions are encoded in the package path (`.v1`, `.v2`). Six package pairs have both versions; v2 supersedes v1 in all cases.
+
+### Key Message Types
+
+| Message | Package | Kafka Topic / Transport | Producer | Consumer(s) |
+|---------|---------|------------------------|----------|-------------|
+| `SingleEvent` | `ecs.event.v1` | `raw-events` | Sensor Gateway (unpacked from EventBatch) | cep-service, clickhouse-ingester-v2, Flink |
+| `EventBatch` | `phoenix.events.raw.v1` | ppRPC agent→gateway | Phoenix Agent | Sensor Gateway |
+| `OpaqueEventBatch` | `phoenix.events.raw.v1` | ppRPC (gateway-internal) | Sensor Gateway | Sensor Gateway (zero-copy unpack) |
+| `Detection` | `ecs.detect.v1` | `detections` | cep-service, Flink, ETL | correlation-service, detection-store |
+| `CoreAgentInfo` | `ecs.agent.v1` | `agents_v2` (embedded in FullAgentInfo) | Phoenix Agent | platform-store, asset-store |
+| `FullAgentInfo` | `phoenix.agent.v1` | ppRPC `/agent/{sensor_id}` | Phoenix Agent | Sensor Gateway → platform-store |
+| `CommandControlRequest` | `phoenix.commandcontrol.v1` | `actions` | dispatcher-service | Sensor Gateway → MQTT/WNS → Agent |
+| `CommandControlResponse` | `phoenix.commandcontrol.v1` | `actions-response` | Phoenix Agent | sensor-action-store |
+| `ChainTrigger` | `phoenix.cep.v1` | `triggers` | cep-chainmaker | detection-correlator |
+| `VendorRawEnvelope` | `phoenix.etl_service.v2` | `xdr-vendor-raw` | xdr-worker-v2 | etl-service-v2 |
+| `OrganizationChangeNotification` | `phoenix.organization_store.v1` | `organization-changes` | organization-store | sensor-gateway, sensor-auth |
+| `PhoenixRuleControlEvent` | `phoenix.rulecontrol.v1` | `rule-control-events` | rule-control-service | Flink CEP jobs, cep-service |
+
+### Kafka Topic to Message Mapping
+
+| Topic | Message Type | Producer | Consumer(s) |
+|-------|-------------|----------|-------------|
+| `raw-events` | `ecs.event.v1.SingleEvent` | Sensor Gateway | cep-service, clickhouse-ingester-v2, Flink |
+| `detections` | `ecs.detect.v1.Detection` | cep-service, Flink, ETL, EDR sensor | detection-store, correlation-service |
+| `agents_v2` | `ecs.agent.v1.CoreAgentInfo` (in FullAgentInfo) | Phoenix Agent via sensor-gateway | platform-store, asset-store |
+| `actions` | `phoenix.commandcontrol.v1.CommandControlRequest` | dispatcher-service | sensor-gateway → MQTT/WNS → agent |
+| `actions-response` | `phoenix.commandcontrol.v1.CommandControlResponse` | sensor-gateway | sensor-action-store |
+| `triggers` | `phoenix.cep.v1.ChainTrigger` | cep-chainmaker | detection-correlator |
+| `organization-changes` | `phoenix.organization_store.v1.OrganizationChangeNotification` | organization-store | sensor-gateway, sensor-auth |
+| `rule-control-events` | `phoenix.rulecontrol.v1.PhoenixRuleControlEvent` | rule-control-service | Flink CEP jobs, cep-service |
+| `xdr-vendor-raw` | `phoenix.etl_service.v2.VendorRawEnvelope` | xdr-worker-v2 | etl-service-v2 |
+| `cep-stage-events` | `phoenix.cep.v1.StageEventBatch` | cep-service | cep-chainmaker |
+
+### gRPC Service Definitions
+
+61 gRPC services are defined across the platform service packages. Selected key services:
+
+| Service | Proto package | Port |
+|---------|--------------|------|
+| `SensorAuthChallengeService` | `phoenix.auth.v2` | 50051 |
+| `SensorService` | `phoenix.platform_store.v1` | 50052 |
+| `RawEventService` | `phoenix.event_store.v1` | 50053 |
+| `BatchActionService` | `phoenix.sensor_action_store.v1` | 50054 |
+| `CommandService` | `phoenix.command_service.v1` | 50055 |
+| `AssetService` | `phoenix.asset_store.v1` | 50056 |
+| `MitreService` | `phoenix.mitre_service.v1` | 50057 |
+| `RuleControlService` | `phoenix.rulecontrol.v1` | 50058 |
+| `OrganizationService` | `phoenix.organization_store.v1` | 50059 |
+| `DetectionService` / `DetectionIngestService` | `phoenix.detection_store.v1` | detection-store port |
+| `VaultService` | `phoenix.vault.v1` / `phoenix.vault.v2` | vault-service port |
+| `EtlTransformService` | `phoenix.etl_service.v2` | etl-service port |
+
+All services include a `HealthService` (`common.health.v1`) implementing the standard gRPC health check protocol (Kubernetes-compatible liveness/readiness probes).
+
+### Code Generation
+
+```bash
+# Regenerate Go stubs (output to gen/go/)
+cd projects/phoenix-proto
+buf generate
+
+# Lint proto sources
+buf lint
+
+# Check for breaking changes against main
+buf breaking --against '.git#branch=main'
+```
+
+Go stubs are generated via `buf.gen.yaml` using `protocolbuffers/go v1.31.0` and `grpc/go v1.3.0`, output to `gen/go/` with source-relative paths. Rust code generation is handled separately inside each Rust crate using `prost-build` in `build.rs`. No TypeScript generation is configured in this repository.
+
+---
+
 ## Integration Contract: Agent to Server
 
 | Aspect | Detail |
@@ -433,7 +521,8 @@ The static HKDF key used on Linux/macOS is XOR-obfuscated (mask `0xBD`) in the b
 | Registration schema | `CoreAgentInfo` embedded in `FullAgentInfo` → `agents_v2` Kafka topic |
 | Events land in | `raw-events` Kafka topic → ClickHouse via `clickhouse-ingester-v2` |
 | Detections land in | `detections` Kafka topic → correlation-service → detection-store → PostgreSQL |
-| Proto source | `modules/proto/proto/` (git submodule); generated into `rust/pbgen/` and `golang/pbgen/` |
+| Schema source | `phoenix-proto` repo (canonical); server embeds via git submodule at `modules/proto/`; agent embeds via `phoenix-protobuf` crate (prost-build) |
+| Proto source | `projects/phoenix-proto/proto/` (canonical); generated Go stubs in `modules/proto/gen/go/` (`golang/pbgen/`); generated Rust structs in `rust/pbgen/` via prost-build |
 
 ---
 
@@ -461,6 +550,24 @@ The static HKDF key used on Linux/macOS is XOR-obfuscated (mask `0xBD`) in the b
 - **[Medium] `#[instrument]` coverage incomplete**: Only 51 files in the Rust workspace use `tracing::instrument`. `correlation-service` gRPC handlers and `event-store` service layer have no per-request spans. `org_id` is missing from span fields in most services — only `vault-service`, `asset-store`, and `xdr-action-store` include it.
 - **[Medium] `expect()` in production paths**: `/rust/notification-dispatcher/src/sendgrid.rs:20` and `template_resolver.rs:85` call `.expect("Failed to create HTTP client")`. These panic on any `reqwest` client construction failure.
 - **[Medium] `any[]` in portal**: `/phoenix-portal/src/server/api/routers/investigation.ts:1311` declares `const allResults: any[]`. A union type should be used.
+
+### Phoenix Proto (Score: 7/10)
+
+**Scale:** 236 proto files, 1,607 messages, 284 enums, 61 gRPC services
+
+**Strengths:**
+- All 284 enums have the correct `_UNSPECIFIED` zero value, preventing silent misinterpretation of default-initialised fields.
+- `OpaqueEventBatch`/`OpaqueSingleEvent` pairing is an excellent wire-compatibility pattern — the sensor gateway can forward events to Kafka without deserialising individual event payloads, preserving wire-format independence between agent and downstream consumers.
+- `org_id` is enforced at schema level with mandatory constraints on all sensor-facing event and detection messages. `AssetInstance` carries an explicit comment: "Multi-tenancy: `org_id` MUST be set and derived from authenticated scope. Never accept from untrusted input."
+- `optional` is used correctly throughout to distinguish missing from zero-value — essential for a sensor protocol where field absence is semantically significant.
+- `reserved` statements (112 found) protect deleted field numbers with both numeric and name forms in the files that use them.
+- Deprecation is expressed at the proto level via `[deprecated = true]` options and package-level comments, with migration guidance provided inline.
+
+**Issues to address:**
+- **[Medium] Submodule drift** — `projects/Phoenix/modules/proto` is pinned at commit `cd67b45e`, one commit behind HEAD (`446c777f` "Add RPC Protos"). Three files are missing from the server's view: `px_event.proto` (updated), `px_rpc.proto`, `px_msrpc.proto`. The drift is additive (no wire break today), but any server-side code referencing `EventSpecific.rpc` (field 37) or the four new `EVENT_ACTION_RPC_*` enum values will fail to compile until the submodule is bumped. Run `git -C projects/Phoenix submodule update --remote modules/proto` and regenerate Go and Rust bindings.
+- **[Medium] No buf breaking baseline** — `buf.yaml` configures `FILE`-mode breaking change detection but specifies no `against` reference. Without it, `buf breaking` is a no-op unless `--against` is supplied manually at CI call time. Add `against: '.git#branch=main'` to `buf.yaml` to make the check active by default.
+- **[Medium] Raw epoch integers** — Four or more locations use `int64`/`uint64` for timestamps instead of `cybereason.common.v1.Timestamp`: `px_policy_svc.proto:117`, `px_policy_data.proto:999`, `px_sensor_policy.proto:72` (all use millisecond epoch `int64`), `px_command_kill_process.proto:17`, and multiple `uint64 *_ns` nanosecond fields in `xdr_integration_store`, `integration_manager`, `integration_proxy`, and `vault` v2 files. Migrate to `Timestamp` using new field numbers with `reserved` statements on the old ones.
+- **[Low] Unprotected field-number gaps** — `DetectionEvent` jumps 43→100, `AssetInstance` 32→200, `Policy` has three unexplained gaps, and `DocumentProtectionEngineStatus` jumps 1→21 — all without `reserved` statements covering the gaps. Without reservations a developer could accidentally reuse a deleted field number, causing silent data corruption for deployed agents. Add `reserved` statements to document intent and prevent accidental reuse.
 
 ### Phoenix Agent (Score: 6.5/10)
 
@@ -602,6 +709,12 @@ bun run test:e2e          # Playwright E2E tests (from phoenix-portal/)
 **DPAPI (Windows Data Protection API):** Used by Sunbird on Windows to encrypt the SQLite DEK using the SYSTEM account's machine-scope credentials (`CRYPTPROTECT_LOCAL_MACHINE`), ensuring only the same machine can decrypt it.
 
 **Malop Score:** A severity score assigned to a Malop based on the combination of detection rules fired, MITRE tactics matched, and asset criticality. Recomputed periodically by the `score-recompute` service.
+
+**buf:** The Buf CLI tool used to lint, build, and check breaking changes in Protobuf schemas. Phoenix uses buf v2 with the `STANDARD` ruleset for `phoenix-proto`. `buf generate` produces Go stubs; `buf lint` enforces naming conventions; `buf breaking` detects wire-incompatible changes. The `buf.yaml` module file configures lint rules, breaking-change strategy (`FILE` mode), and code-generation plugins.
+
+**Submodule drift:** A state in which a git submodule reference (the pinned commit SHA stored in the parent repository) lags behind the HEAD of the submodule's upstream repository. In Phoenix, the server's `modules/proto` submodule pointing to `phoenix-proto` is one commit behind HEAD, meaning three proto files present in the canonical repo are absent from the server's generated output. Drift is additive here (no wire break), but any code referencing the new fields will fail to compile until the submodule is bumped.
+
+**OpaqueEventBatch / OpaqueSingleEvent:** A pair of Protobuf messages in `phoenix.events.raw.v1` / `ecs.event.v1` that allow the sensor gateway to unpack an `EventBatch` header (common fields) without deserialising each individual `EventSpecific` payload. The gateway reads the serialised `EventCommon` bytes, clones them onto each opaque event blob, and publishes the result to Kafka — achieving zero-copy forwarding of event bodies while still attaching tenant and agent metadata.
 
 **VRL (Vector Remap Language):** A scripting language used in `etl-service-v2` to transform raw XDR vendor log payloads (any format) into normalized `SingleEvent` Protobuf format before they enter the `raw-events` Kafka topic.
 
