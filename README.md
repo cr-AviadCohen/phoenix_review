@@ -1,2 +1,2 @@
-# pheonix_review
+# phoenix_review
 Review Phoenix projects
