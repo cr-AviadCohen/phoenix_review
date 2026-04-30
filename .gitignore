@@ -1,6 +1,7 @@
 # IGNORE
-*/projects/Phoenix/
-*/projects/phoenix-agent/
+/projects/Phoenix/
+/projects/phoenix-agent/
+.idea/
 .cursor/
 .claude/
 .claude-flow/
