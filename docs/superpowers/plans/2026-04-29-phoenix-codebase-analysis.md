@@ -459,7 +459,7 @@ When adding a new project, only the **new** rows need execution. Synthesis must 
 - [ ] **Step 4: Commit**
 
   ```bash
-  git add docs/analysis/phoenix-platform-architecture.md
+  git add docs/analysis/phoenix-analysis-architecture.md
   git commit -m "docs: update unified platform architecture overview"
   ```
 
